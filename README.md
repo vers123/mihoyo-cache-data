@@ -24,7 +24,9 @@ mihoyo-cache-data/
 │   ├── unknown/               # 无法识别的文件
 │   └── video/                 # WebM 视频（含 EBML 头及 1MB 分片）
 ├── scripts/
-│   └── extract_cache.py       # 提取与分类脚本
+│   ├── extract_cache.py       # 提取与分类脚本（CLI）
+│   └── gui.py                 # 图形界面（tkinter）
+├── requirements.txt
 ├── .github/workflows/release.yml
 ├── .gitignore
 ├── LICENSE
@@ -46,7 +48,39 @@ mihoyo-cache-data/
 
 ## 使用方法
 
-### 重新提取分类
+### 环境准备
+
+GUI 模式依赖 `tqdm`（进度条）和 `tkinterdnd2`（拖拽支持），建议使用虚拟环境：
+
+```bash
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# Linux / macOS
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+> CLI 模式（`extract_cache.py`）仅依赖标准库，可不安装依赖直接运行；
+> 若未安装 `tqdm`，会自动退化为普通逐行输出。
+
+### 图形界面（推荐）
+
+```bash
+python scripts/gui.py
+```
+
+功能：
+- 输入/输出路径选择（浏览按钮 + 文件夹拖拽）
+- 实时进度条与日志输出
+- 分类统计表格
+- 一键打开输出目录
+- 主题切换（clam / alt / default / classic 等）
+- 多语言（中文 / English）
+- 覆盖已存在文件、静默模式选项
+
+### 命令行模式
 
 确保本地存在 miHoYo/HYP 的 `Cache_Data` 目录，然后运行：
 

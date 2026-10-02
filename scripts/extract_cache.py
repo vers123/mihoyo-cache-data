@@ -29,7 +29,13 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
+
+try:
+    from tqdm import tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +203,44 @@ def resolve_output_dir(cli_output: Optional[str]) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# 核心提取流程
+# ---------------------------------------------------------------------------
+
+ProgressCallback = Callable[[int, int, str, str], None]
+
+
+def extract(
+    input_dir: Path,
+    output_root: Path,
+    force: bool = False,
+    progress: Optional[ProgressCallback] = None,
+) -> dict[str, int]:
+    """扫描 input_dir 并分类复制到 output_root。
+
+    参数:
+        input_dir:  缓存目录 (Cache_Data)
+        output_root: 分类结果根目录 (Cache_Sorted)
+        force:      是否覆盖已存在的目标文件
+        progress:   进度回调 callback(current, total, type_name, filename)，
+                    每处理完一个文件调用一次；为 None 时不回调。
+
+    返回:
+        各类型计数 dict，如 {"png": 86, "jpeg": 75, ...}
+    """
+    files = sorted(iter_cache_files(input_dir))
+    total = len(files)
+    counts: dict[str, int] = {}
+
+    for i, src in enumerate(files, 1):
+        type_name, _rel = classify_and_copy(src, output_root, force=force)
+        counts[type_name] = counts.get(type_name, 0) + 1
+        if progress is not None:
+            progress(i, total, type_name, src.name)
+
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -231,18 +275,31 @@ def main() -> int:
     print(f"输出目录: {output_dir}")
     print("-" * 60)
 
-    files = sorted(iter_cache_files(input_dir))
+    files = list(iter_cache_files(input_dir))
     total = len(files)
     if total == 0:
         print("[警告] 输入目录中没有文件。")
         return 0
 
-    counts: dict[str, int] = {}
-    for i, src in enumerate(files, 1):
-        type_name, rel = classify_and_copy(src, output_dir, force=args.force)
-        counts[type_name] = counts.get(type_name, 0) + 1
-        if not args.quiet:
-            print(f"[{i}/{total}] {type_name:>12}  {src.name}  ->  {rel}")
+    # 根据是否安装 tqdm 选择进度展示方式
+    if _HAS_TQDM:
+        pbar = tqdm(total=total, desc="分类中", unit="file", ncols=80)
+
+        def _progress(current: int, _total: int, type_name: str, filename: str) -> None:
+            pbar.update(1)
+            pbar.set_postfix_str(f"{type_name}")
+            if not args.quiet:
+                tqdm.write(f"  {type_name:>12}  {filename}")
+
+        counts = extract(input_dir, output_dir, force=args.force, progress=_progress)
+        pbar.close()
+    else:
+        # 无 tqdm 时退化为普通逐行输出
+        def _progress(current: int, total: int, type_name: str, filename: str) -> None:
+            if not args.quiet:
+                print(f"[{current}/{total}] {type_name:>12}  {filename}")
+
+        counts = extract(input_dir, output_dir, force=args.force, progress=_progress)
 
     print("-" * 60)
     print("分类汇总:")
