@@ -25,7 +25,7 @@ mihoyo-cache-data/
 │   └── video/                 # WebM 视频（含 EBML 头及 1MB 分片）
 ├── scripts/
 │   ├── extract_cache.py       # 提取与分类脚本（CLI）
-│   └── gui.py                 # 图形界面（tkinter）
+│   └── gui.py                 # 图形界面（PySide6）
 ├── requirements.txt
 ├── .github/workflows/release.yml
 ├── .gitignore
@@ -50,7 +50,7 @@ mihoyo-cache-data/
 
 ### 环境准备
 
-GUI 模式依赖 `tqdm`（进度条）和 `tkinterdnd2`（拖拽支持），建议使用虚拟环境：
+GUI 模式依赖 `tqdm`（进度条）和 `PySide6`（界面框架），建议使用虚拟环境：
 
 ```bash
 python -m venv .venv
@@ -76,9 +76,10 @@ python scripts/gui.py
 - 实时进度条与日志输出
 - 分类统计表格
 - 一键打开输出目录
-- 主题切换（clam / alt / default / classic 等）
+- 主题切换（Fusion / 系统原生 / 亮色 / 暗色）
 - 多语言（中文 / English）
 - 覆盖已存在文件、静默模式选项
+- 后台线程执行，不阻塞 UI
 
 ### 命令行模式
 

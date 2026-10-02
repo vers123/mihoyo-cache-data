@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gui.py - miHoYo 缓存提取工具的图形界面。
+gui.py - miHoYo 缓存提取工具的图形界面（PySide6 版本）。
 
 功能：
-    - 输入/输出路径选择（浏览按钮 + 拖拽）
+    - 输入/输出路径选择（浏览按钮 + 拖拽文件夹）
     - 分类进度条与实时日志
     - 分类统计表格
     - 打开输出目录
-    - 主题切换 / 多语言（中文 / English）
+    - 主题切换（Fusion / 系统原生 / 暗色 / 亮色）
+    - 多语言（中文 / English）
 
 依赖：
-    pip install tqdm tkinterdnd2
+    pip install PySide6
 
 运行：
     python scripts/gui.py
@@ -19,28 +20,38 @@ gui.py - miHoYo 缓存提取工具的图形界面。
 
 from __future__ import annotations
 
-import os
-import queue
-import subprocess
 import sys
-import threading
 from pathlib import Path
-from tkinter import StringVar, BooleanVar, filedialog, messagebox
-from tkinter import ttk
-import tkinter as tk
 
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-    _HAS_DND = True
-except ImportError:
-    _HAS_DND = False
+from PySide6.QtCore import Qt, QThread, Signal, QUrl
+from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 
 # 让 scripts/ 目录下的模块可被导入
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from extract_cache import (  # noqa: E402
     extract,
     default_cache_dir,
-    project_root,
     resolve_output_dir,
 )
 
@@ -76,7 +87,8 @@ I18N = {
         "no_input": "请先选择缓存目录",
         "no_output": "请先选择输出目录",
         "input_not_dir": "输入路径不是有效目录",
-        "cleared": "已清空统计",
+        "stopped": "已停止",
+        "themes": ["Fusion", "系统原生", "亮色", "暗色"],
         "lang_zh": "中文",
         "lang_en": "English",
     },
@@ -106,350 +118,399 @@ I18N = {
         "no_input": "Please select a cache directory",
         "no_output": "Please select an output directory",
         "input_not_dir": "Input path is not a valid directory",
-        "cleared": "Stats cleared",
+        "stopped": "Stopped",
+        "themes": ["Fusion", "System", "Light", "Dark"],
         "lang_zh": "中文",
         "lang_en": "English",
     },
 }
 
-THEMES = ["clam", "alt", "default", "classic", "vista", "xpnative"]
+# 主题键：I18N 显示名 -> 应用函数
+THEME_KEYS = ["fusion", "native", "light", "dark"]
 
 
-class App:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
+# ---------------------------------------------------------------------------
+# 拖拽输入框
+# ---------------------------------------------------------------------------
+
+class DropLineEdit(QLineEdit):
+    """支持拖拽文件夹路径的输入框。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self._placeholder = ""
+
+    def setPlaceholder(self, text: str) -> None:
+        self._placeholder = text
+        self.setPlaceholderText(text)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        urls = event.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            if path:
+                self.setText(path)
+                self.setStyleSheet("")
+
+
+# ---------------------------------------------------------------------------
+# 后台提取线程
+# ---------------------------------------------------------------------------
+
+class ExtractThread(QThread):
+    progress = Signal(int, int, str, str)   # current, total, type_name, filename
+    finished_ok = Signal(dict)              # counts
+    stopped = Signal(dict)                  # counts
+    failed = Signal(str)                    # error message
+
+    def __init__(self, input_dir: Path, output_dir: Path, force: bool, quiet: bool):
+        super().__init__()
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        self.force = force
+        self.quiet = quiet
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        try:
+            counts = extract(
+                self.input_dir,
+                self.output_dir,
+                force=self.force,
+                progress=self._on_progress,
+            )
+            if self._stop:
+                self.stopped.emit(counts)
+            else:
+                self.finished_ok.emit(counts)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _on_progress(self, current: int, total: int, type_name: str, filename: str) -> None:
+        if not self._stop:
+            self.progress.emit(current, total, type_name, filename)
+
+
+# ---------------------------------------------------------------------------
+# 主窗口
+# ---------------------------------------------------------------------------
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
         self.lang = "zh_CN"
         self.tr = I18N[self.lang]
-
-        self.input_var = StringVar()
-        self.output_var = StringVar(value=str(resolve_output_dir(None)))
-        self.force_var = BooleanVar(value=False)
-        self.quiet_var = BooleanVar(value=False)
-        self.theme_var = StringVar(value="clam")
-
-        self.worker: threading.Thread | None = None
-        self.stop_event = threading.Event()
-        self.msg_queue: queue.Queue = queue.Queue()
+        self.worker: ExtractThread | None = None
         self._stats: dict[str, int] = {}
 
         self._build_ui()
-        self._apply_theme()
-        self._poll_queue()
+        self._apply_theme("fusion")
+        self._refresh_texts()
 
-    # ------------------------------------------------------------------ UI
+    # ------------------------------------------------------------- build UI
     def _build_ui(self) -> None:
-        tr = self.tr
-        self.root.title(tr["title"])
-        self.root.geometry("760x640")
-        self.root.minsize(680, 560)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
 
-        style = ttk.Style()
-        self._available_themes = [t for t in THEMES if t in style.theme_names()]
-        if "clam" not in self._available_themes and self._available_themes:
-            self.theme_var.set(self._available_themes[0])
+        # 顶部：语言 + 主题
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(QLabel("语言"))
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItems(["中文", "English"])
+        self.lang_combo.currentIndexChanged.connect(self._on_lang_change)
+        top_bar.addWidget(self.lang_combo)
+        top_bar.addSpacing(20)
+        top_bar.addWidget(QLabel("主题"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(self.tr["themes"])
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_change)
+        top_bar.addWidget(self.theme_combo)
+        top_bar.addStretch(1)
+        root.addLayout(top_bar)
 
-        top = ttk.Frame(self.root, padding=8)
-        top.pack(fill=tk.X)
+        # 路径区
+        path_group = QGroupBox()
+        grid = QGridLayout(path_group)
 
-        # 语言 + 主题
-        opts = ttk.Frame(top)
-        opts.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(opts, text=tr["lang"]).pack(side=tk.LEFT)
-        self.lang_combo = ttk.Combobox(
-            opts, values=[tr["lang_zh"], tr["lang_en"]], width=10, state="readonly"
-        )
-        self.lang_combo.set(tr["lang_zh"])
-        self.lang_combo.pack(side=tk.LEFT, padx=(4, 16))
-        self.lang_combo.bind("<<ComboboxSelected>>", self._on_lang_change)
+        self.input_edit = DropLineEdit()
+        self.output_edit = DropLineEdit()
+        self.input_label = QLabel()
+        self.output_label = QLabel()
+        self.input_browse = QPushButton()
+        self.output_browse = QPushButton()
+        self.input_browse.clicked.connect(lambda: self._browse("input"))
+        self.output_browse.clicked.connect(lambda: self._browse("output"))
 
-        ttk.Label(opts, text=tr["theme"]).pack(side=tk.LEFT)
-        self.theme_combo = ttk.Combobox(
-            opts, values=self._available_themes, width=10, state="readonly",
-            textvariable=self.theme_var,
-        )
-        self.theme_combo.pack(side=tk.LEFT, padx=(4, 0))
-        self.theme_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_theme())
-
-        # 输入路径
-        self._build_path_row(top, "input", self.input_var, tr["drag_hint_input"])
-        # 输出路径
-        self._build_path_row(top, "output", self.output_var, tr["drag_hint_output"])
+        grid.addWidget(self.input_label, 0, 0)
+        grid.addWidget(self.input_edit, 0, 1)
+        grid.addWidget(self.input_browse, 0, 2)
+        grid.addWidget(self.output_label, 1, 0)
+        grid.addWidget(self.output_edit, 1, 1)
+        grid.addWidget(self.output_browse, 1, 2)
+        grid.setColumnStretch(1, 1)
+        root.addWidget(path_group)
 
         # 选项
-        opt_frame = ttk.Frame(top)
-        opt_frame.pack(fill=tk.X, pady=(4, 0))
-        self.force_cb = ttk.Checkbutton(opt_frame, text=tr["force"], variable=self.force_var)
-        self.force_cb.pack(side=tk.LEFT)
-        self.quiet_cb = ttk.Checkbutton(opt_frame, text=tr["quiet"], variable=self.quiet_var)
-        self.quiet_cb.pack(side=tk.LEFT, padx=(12, 0))
+        opt = QHBoxLayout()
+        self.force_cb = QCheckBox()
+        self.quiet_cb = QCheckBox()
+        opt.addWidget(self.force_cb)
+        opt.addWidget(self.quiet_cb)
+        opt.addStretch(1)
+        root.addLayout(opt)
 
         # 进度
-        prog_frame = ttk.LabelFrame(self.root, text=tr["progress"], padding=8)
-        prog_frame.pack(fill=tk.X, padx=8, pady=(4, 0))
-        self.progress = ttk.Progressbar(prog_frame, mode="determinate")
-        self.progress.pack(fill=tk.X)
-        self.progress_label = ttk.Label(prog_frame, text=tr["ready"])
-        self.progress_label.pack(anchor=tk.W, pady=(4, 0))
+        prog_group = QGroupBox()
+        pvl = QVBoxLayout(prog_group)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_label = QLabel()
+        pvl.addWidget(self.progress_bar)
+        pvl.addWidget(self.progress_label)
+        root.addWidget(prog_group)
 
-        # 按钮区
-        btn_frame = ttk.Frame(self.root, padding=(8, 4))
-        btn_frame.pack(fill=tk.X)
-        self.start_btn = ttk.Button(btn_frame, text=tr["start"], command=self._on_start)
-        self.start_btn.pack(side=tk.LEFT)
-        self.open_btn = ttk.Button(btn_frame, text=tr["open_output"], command=self._open_output)
-        self.open_btn.pack(side=tk.LEFT, padx=(8, 0))
+        # 按钮
+        btn_row = QHBoxLayout()
+        self.start_btn = QPushButton()
+        self.start_btn.clicked.connect(self._on_start)
+        self.open_btn = QPushButton()
+        self.open_btn.clicked.connect(self._open_output)
+        btn_row.addWidget(self.start_btn)
+        btn_row.addWidget(self.open_btn)
+        btn_row.addStretch(1)
+        root.addLayout(btn_row)
 
-        # 主体：左日志，右统计
-        body = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
-        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        # 主体：日志 + 统计
+        splitter = QSplitter(Qt.Horizontal)
+        self.log_text = QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        splitter.addWidget(self._wrap_group(self.log_text))
 
-        # 日志
-        log_frame = ttk.LabelFrame(body, text=tr["log"], padding=4)
-        body.add(log_frame, weight=3)
-        self.log_text = tk.Text(log_frame, wrap=tk.WORD, height=10, state=tk.DISABLED)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.stats_table = QTableWidget(0, 2)
+        self.stats_table.horizontalHeader().setStretchLastSection(True)
+        self.stats_table.verticalHeader().setVisible(False)
+        self.stats_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.stats_table.setSelectionMode(QTableWidget.NoSelection)
+        splitter.addWidget(self._wrap_group(self.stats_table))
+        splitter.setSizes([460, 220])
+        root.addWidget(splitter, 1)
 
-        # 统计表格
-        stats_frame = ttk.LabelFrame(body, text=tr["stats"], padding=4)
-        body.add(stats_frame, weight=1)
-        self.tree = ttk.Treeview(stats_frame, columns=("count",), show="tree headings", height=10)
-        self.tree.heading("#0", text=tr["type"])
-        self.tree.heading("count", text=tr["count"])
-        self.tree.column("#0", width=110)
-        self.tree.column("count", width=60, anchor=tk.E)
-        self.tree.pack(fill=tk.BOTH, expand=True)
+        self.resize(780, 620)
+        self.setMinimumSize(700, 540)
 
-    def _build_path_row(self, parent, kind: str, var: StringVar, hint: str) -> None:
-        tr = self.tr
-        label_text = tr["input"] if kind == "input" else tr["output"]
-        row = ttk.Frame(parent)
-        row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text=label_text, width=18).pack(side=tk.LEFT)
-        entry = ttk.Entry(row, textvariable=var)
-        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-
-        if kind == "input":
-            self.input_entry = entry
-        else:
-            self.output_entry = entry
-
-        browse = ttk.Button(row, text=tr["browse"], width=10,
-                            command=lambda: self._browse(kind))
-        browse.pack(side=tk.LEFT)
-
-        # 拖拽支持
-        if _HAS_DND:
-            entry.drop_target_register(DND_FILES)
-            entry.dnd_bind("<<Drop>>", lambda e, k=kind: self._on_drop(e, k))
-            entry.configure(foreground="gray")
-            var.set(hint)
-            entry.bind("<FocusIn>", lambda e, k=kind: self._clear_hint(k))
-        else:
-            if kind == "input":
-                # 无 DND 时填入默认路径提示
-                d = default_cache_dir()
-                if d:
-                    var.set(str(d))
-
-    # ------------------------------------------------------------- helpers
-    def _clear_hint(self, kind: str) -> None:
-        var = self.input_var if kind == "input" else self.output_var
-        tr = self.tr
-        hint = tr["drag_hint_input"] if kind == "input" else tr["drag_hint_output"]
-        if var.get() == hint:
-            var.set("")
-
-    def _browse(self, kind: str) -> None:
-        var = self.input_var if kind == "input" else self.output_var
-        d = filedialog.askdirectory()
+        # 预填默认输出路径
+        self.output_edit.setText(str(resolve_output_dir(None)))
+        # 预填默认输入路径提示
+        d = default_cache_dir()
         if d:
-            var.set(d)
-            entry = self.input_entry if kind == "input" else self.output_entry
-            entry.configure(foreground="black")
+            self.input_edit.setText(str(d))
 
-    def _on_drop(self, event, kind: str) -> None:
-        paths = self.root.tk.splitlist(event.data)
-        if paths:
-            var = self.input_var if kind == "input" else self.output_var
-            var.set(paths[0])
-            entry = self.input_entry if kind == "input" else self.output_entry
-            entry.configure(foreground="black")
+    def _wrap_group(self, widget: QWidget) -> QGroupBox:
+        box = QGroupBox()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.addWidget(widget)
+        return box
 
-    def _apply_theme(self) -> None:
-        style = ttk.Style()
-        try:
-            style.theme_use(self.theme_var.get())
-        except tk.TclError:
-            pass
-
-    def _on_lang_change(self, _event=None) -> None:
+    # --------------------------------------------------------- text refresh
+    def _refresh_texts(self) -> None:
         tr = self.tr
-        self.lang = "en" if self.lang_combo.get() == tr["lang_en"] else "zh_CN"
+        self.setWindowTitle(tr["title"])
+        self.input_label.setText(tr["input"])
+        self.output_label.setText(tr["output"])
+        self.input_browse.setText(tr["browse"])
+        self.output_browse.setText(tr["browse"])
+        self.force_cb.setText(tr["force"])
+        self.quiet_cb.setText(tr["quiet"])
+        self.start_btn.setText(tr["start"])
+        self.open_btn.setText(tr["open_output"])
+        self.progress_label.setText(tr["ready"])
+        self.input_edit.setPlaceholder(tr["drag_hint_input"])
+        self.output_edit.setPlaceholder(tr["drag_hint_output"])
+
+        # 表格表头
+        self.stats_table.setHorizontalHeaderLabels([tr["type"], tr["count"]])
+
+        # 重组语言下拉显示
+        idx = self.lang_combo.currentIndex()
+        self.lang_combo.blockSignals(True)
+        self.lang_combo.clear()
+        self.lang_combo.addItems([tr["lang_zh"], tr["lang_en"]])
+        self.lang_combo.setCurrentIndex(idx)
+        self.lang_combo.blockSignals(False)
+
+        # 重组主题下拉
+        theme_idx = self.theme_combo.currentIndex()
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.clear()
+        self.theme_combo.addItems(tr["themes"])
+        self.theme_combo.setCurrentIndex(theme_idx)
+        self.theme_combo.blockSignals(False)
+
+    # ------------------------------------------------------------- handlers
+    def _browse(self, kind: str) -> None:
+        d = QFileDialog.getExistingDirectory(self, self.tr["browse"])
+        if d:
+            if kind == "input":
+                self.input_edit.setText(d)
+            else:
+                self.output_edit.setText(d)
+
+    def _on_lang_change(self, idx: int) -> None:
+        self.lang = "zh_CN" if idx == 0 else "en"
         self.tr = I18N[self.lang]
         self._refresh_texts()
 
-    def _refresh_texts(self) -> None:
-        tr = self.tr
-        self.root.title(tr["title"])
-        # 重设 entry 占位提示（仅当为空或为旧提示时）
-        for kind, hint_key in (("input", "drag_hint_input"), ("output", "drag_hint_output")):
-            var = self.input_var if kind == "input" else self.output_var
-            entry = self.input_entry if kind == "input" else self.output_entry
-            old = I18N["zh_CN" if self.lang == "en" else "en"][hint_key]
-            if var.get() in (old, ""):
-                var.set(tr[hint_key])
-                entry.configure(foreground="gray")
+    def _on_theme_change(self, idx: int) -> None:
+        if 0 <= idx < len(THEME_KEYS):
+            self._apply_theme(THEME_KEYS[idx])
 
-        self.force_cb.configure(text=tr["force"])
-        self.quiet_cb.configure(text=tr["quiet"])
-        self.start_btn.configure(text=tr["start"])
-        self.open_btn.configure(text=tr["open_output"])
-        # 重新设置下拉显示名
-        cur = self.lang_combo.get()
-        self.lang_combo.configure(values=[tr["lang_zh"], tr["lang_en"]])
-        self.lang_combo.set(tr["lang_zh"] if self.lang == "zh_CN" else tr["lang_en"])
+    # ------------------------------------------------------------- themes
+    def _apply_theme(self, key: str) -> None:
+        app = QApplication.instance()
+        if key == "fusion":
+            app.setStyle("Fusion")
+            app.setPalette(app.style().standardPalette())
+        elif key == "native":
+            app.setStyle("")  # 系统原生
+            app.setPalette(app.style().standardPalette())
+        elif key == "light":
+            app.setStyle("Fusion")
+            pal = app.style().standardPalette()
+            app.setPalette(pal)
+        elif key == "dark":
+            app.setStyle("Fusion")
+            from PySide6.QtGui import QPalette, QColor
+            pal = QPalette()
+            pal.setColor(QPalette.Window, QColor(53, 53, 53))
+            pal.setColor(QPalette.WindowText, Qt.white)
+            pal.setColor(QPalette.Base, QColor(25, 25, 25))
+            pal.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+            pal.setColor(QPalette.ToolTipBase, Qt.white)
+            pal.setColor(QPalette.ToolTipText, Qt.white)
+            pal.setColor(QPalette.Text, Qt.white)
+            pal.setColor(QPalette.Button, QColor(53, 53, 53))
+            pal.setColor(QPalette.ButtonText, Qt.white)
+            pal.setColor(QPalette.BrightText, Qt.red)
+            pal.setColor(QPalette.Link, QColor(42, 130, 218))
+            pal.setColor(QPalette.Highlight, QColor(42, 130, 218))
+            pal.setColor(QPalette.HighlightedText, Qt.black)
+            app.setPalette(pal)
 
-    # ----------------------------------------------------------- log/stats
+    # ------------------------------------------------------------- log/stats
     def _log(self, msg: str) -> None:
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, msg + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.DISABLED)
+        self.log_text.appendPlainText(msg)
 
     def _update_stats(self, counts: dict[str, int]) -> None:
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        self.stats_table.setRowCount(0)
         total = 0
         for name in sorted(counts):
-            self.tree.insert("", tk.END, text=name, values=(counts[name],))
+            row = self.stats_table.rowCount()
+            self.stats_table.insertRow(row)
+            self.stats_table.setItem(row, 0, QTableWidgetItem(name))
+            self.stats_table.setItem(row, 1, QTableWidgetItem(str(counts[name])))
             total += counts[name]
-        self.tree.insert("", tk.END, text=self.tr["total"], values=(total,))
+        row = self.stats_table.rowCount()
+        self.stats_table.insertRow(row)
+        self.stats_table.setItem(row, 0, QTableWidgetItem(self.tr["total"]))
+        self.stats_table.setItem(row, 1, QTableWidgetItem(str(total)))
 
-    # --------------------------------------------------------------- run
+    # ------------------------------------------------------------- run
     def _on_start(self) -> None:
-        if self.worker and self.worker.is_alive():
-            # 正在运行 → 停止
-            self.stop_event.set()
-            self.start_btn.configure(state=tk.DISABLED)
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.start_btn.setEnabled(False)
             return
 
         tr = self.tr
-        input_path = self.input_var.get().strip()
-        output_path = self.output_var.get().strip()
-        # 清除提示占位
-        if input_path in (tr["drag_hint_input"], I18N["en"]["drag_hint_input"]):
-            input_path = ""
-        if output_path in (tr["drag_hint_output"], I18N["en"]["drag_hint_output"]):
-            output_path = str(resolve_output_dir(None))
+        input_path = self.input_edit.text().strip()
+        output_path = self.output_edit.text().strip()
 
-        if not input_path:
-            messagebox.showwarning(tr["title"], tr["no_input"])
+        if not input_path or input_path in (tr["drag_hint_input"], I18N["en"]["drag_hint_input"]):
+            QMessageBox.warning(self, tr["title"], tr["no_input"])
             return
         if not Path(input_path).is_dir():
-            messagebox.showerror(tr["title"], tr["input_not_dir"])
+            QMessageBox.critical(self, tr["title"], tr["input_not_dir"])
             return
-        if not output_path:
-            messagebox.showwarning(tr["title"], tr["no_output"])
+        if not output_path or output_path in (tr["drag_hint_output"], I18N["en"]["drag_hint_output"]):
+            QMessageBox.warning(self, tr["title"], tr["no_output"])
             return
 
-        # 清空旧状态
-        self.stop_event.clear()
         self._stats = {}
         self._update_stats({})
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.delete("1.0", tk.END)
-        self.log_text.configure(state=tk.DISABLED)
+        self.log_text.clear()
+        self.start_btn.setText(tr["stop"])
+        self.progress_label.setText(tr["running"])
+        self.progress_bar.setValue(0)
 
-        self.start_btn.configure(text=tr["stop"])
-        self.progress_label.configure(text=tr["running"])
-        self.progress["value"] = 0
-        self.progress["maximum"] = 100
-
-        self.worker = threading.Thread(
-            target=self._run_extract,
-            args=(Path(input_path), Path(output_path), self.force_var.get()),
-            daemon=True,
+        self.worker = ExtractThread(
+            Path(input_path), Path(output_path),
+            force=self.force_cb.isChecked(),
+            quiet=self.quiet_cb.isChecked(),
         )
+        self.worker.progress.connect(self._on_progress)
+        self.worker.finished_ok.connect(self._on_done)
+        self.worker.stopped.connect(self._on_stopped)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.finished.connect(self._on_worker_finished)
         self.worker.start()
 
-    def _run_extract(self, input_dir: Path, output_dir: Path, force: bool) -> None:
-        quiet = self.quiet_var.get()
+    def _on_progress(self, current: int, total: int, type_name: str, filename: str) -> None:
+        pct = int(current / total * 100) if total else 0
+        self.progress_bar.setValue(pct)
+        self.progress_label.setText(f"{current}/{total}  {type_name}")
+        self._stats[type_name] = self._stats.get(type_name, 0) + 1
+        if not self.quiet_cb.isChecked():
+            self._log(f"  {type_name:>12}  {filename}")
+        self._update_stats(self._stats)
 
-        def _progress(current: int, total: int, type_name: str, filename: str) -> None:
-            if self.stop_event.is_set():
-                return
-            self.msg_queue.put(("progress", current, total, type_name, filename))
+    def _on_done(self, counts: dict[str, int]) -> None:
+        self._update_stats(counts)
+        total = sum(counts.values())
+        self.progress_bar.setValue(100)
+        self.progress_label.setText(self.tr["done"].format(total=total))
+        self._log(self.tr["done"].format(total=total))
 
-        try:
-            counts = extract(input_dir, output_dir, force=force, progress=_progress)
-            if not self.stop_event.is_set():
-                self.msg_queue.put(("done", counts))
-            else:
-                self.msg_queue.put(("stopped", counts))
-        except Exception as exc:
-            self.msg_queue.put(("error", str(exc)))
+    def _on_stopped(self, counts: dict[str, int]) -> None:
+        self._update_stats(counts)
+        self.progress_label.setText(self.tr["stopped"])
+        self._log("--- " + self.tr["stopped"] + " ---")
 
-    def _poll_queue(self) -> None:
-        try:
-            while True:
-                msg = self.msg_queue.get_nowait()
-                kind = msg[0]
-                if kind == "progress":
-                    _, current, total, type_name, filename = msg
-                    pct = (current / total * 100) if total else 0
-                    self.progress["value"] = pct
-                    self.progress_label.configure(
-                        text=f"{current}/{total}  {type_name}"
-                    )
-                    self._stats[type_name] = self._stats.get(type_name, 0) + 1
-                    if not self.quiet_var.get():
-                        self._log(f"  {type_name:>12}  {filename}")
-                    self._update_stats(self._stats)
-                elif kind == "done":
-                    counts = msg[1]
-                    self._update_stats(counts)
-                    total = sum(counts.values())
-                    self.progress["value"] = 100
-                    self.progress_label.configure(text=self.tr["done"].format(total=total))
-                    self._log(self.tr["done"].format(total=total))
-                    self.start_btn.configure(text=self.tr["start"], state=tk.NORMAL)
-                    self.worker = None
-                elif kind == "stopped":
-                    counts = msg[1]
-                    self._update_stats(counts)
-                    self.progress_label.configure(text=self.tr["ready"])
-                    self._log("--- stopped ---")
-                    self.start_btn.configure(text=self.tr["start"], state=tk.NORMAL)
-                    self.worker = None
-                elif kind == "error":
-                    self._log(f"[ERROR] {msg[1]}")
-                    self.start_btn.configure(text=self.tr["start"], state=tk.NORMAL)
-                    self.worker = None
-        except queue.Empty:
-            pass
-        self.root.after(50, self._poll_queue)
+    def _on_failed(self, msg: str) -> None:
+        self._log(f"[ERROR] {msg}")
+
+    def _on_worker_finished(self) -> None:
+        self.start_btn.setText(self.tr["start"])
+        self.start_btn.setEnabled(True)
+        self.worker = None
 
     def _open_output(self) -> None:
-        output = self.output_var.get().strip()
-        if not output or output in (self.tr["drag_hint_output"], I18N["en"]["drag_hint_output"]):
+        output = self.output_edit.text().strip()
+        tr = self.tr
+        if not output or output in (tr["drag_hint_output"], I18N["en"]["drag_hint_output"]):
             output = str(resolve_output_dir(None))
         path = Path(output)
         path.mkdir(parents=True, exist_ok=True)
-        if sys.platform.startswith("win"):
-            os.startfile(str(path))  # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(path)])
-        else:
-            subprocess.Popen(["xdg-open", str(path)])
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
 def main() -> None:
-    if _HAS_DND:
-        root = TkinterDnD.Tk()
-    else:
-        root = tk.Tk()
-    App(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
