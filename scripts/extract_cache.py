@@ -27,16 +27,27 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 try:
     from tqdm import tqdm
     _HAS_TQDM = True
 except ImportError:
     _HAS_TQDM = False
+
+from cache_parser import (  # noqa: E402
+    CacheEntry,
+    classify_by_url,
+    get_seg_index,
+    get_video_base_url,
+    is_video_segment,
+    parse_cache,
+    url_to_filename,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +204,62 @@ def classify_and_copy(
 
     shutil.copy2(src, dest)
     return type_name, str(dest.relative_to(output_root))
+
+
+# ---------------------------------------------------------------------------
+# 视频分片合并
+# ---------------------------------------------------------------------------
+
+def merge_video_segments(
+    entries: List[CacheEntry],
+    input_dir: Path,
+    output_root: Path,
+    force: bool = False,
+) -> List[Tuple[str, str]]:
+    """将视频分片合并为完整视频文件。
+
+    返回: [(type_name, dest_rel_path), ...]
+    """
+    results = []
+    video_dir = output_root / "video"
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+    # 按基础 URL 分组
+    groups: Dict[str, List[CacheEntry]] = {}
+    for e in entries:
+        if is_video_segment(e.url) and e.body_file:
+            base = get_video_base_url(e.url)
+            groups.setdefault(base, []).append(e)
+
+    for base, segs in groups.items():
+        # 按分片序号排序
+        segs.sort(key=lambda x: get_seg_index(x.url))
+        # 只合并有 body_file 的分片
+        segs_with_body = [s for s in segs if s.body_file]
+        if not segs_with_body:
+            continue
+
+        # 输出文件名
+        out_name = url_to_filename(base)
+        if not out_name.endswith(".webm"):
+            out_name += ".webm"
+        dest = video_dir / out_name
+
+        if dest.exists() and not force:
+            results.append(("video", str(dest.relative_to(output_root))))
+            continue
+
+        # 按顺序拼接分片
+        with open(dest, "wb") as out_f:
+            for s in segs_with_body:
+                src = input_dir / s.body_file
+                if src.exists():
+                    with open(src, "rb") as in_f:
+                        shutil.copyfileobj(in_f, out_f)
+
+        results.append(("video", str(dest.relative_to(output_root))))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +477,8 @@ def extract(
     do_verify: bool = False,
     do_verify_content: bool = False,
     report_path: Optional[Path] = None,
+    use_cache_meta: bool = True,
+    merge_video: bool = True,
 ) -> dict[str, int]:
     """扫描 input_dir 并分类复制到 output_root。
 
@@ -421,6 +490,8 @@ def extract(
         do_verify:        复制后校验完整性（大小 + SHA256）
         do_verify_content: 校验文件内容结构是否符合类型
         report_path:      校验报告输出路径（JSON），为 None 则不生成报告
+        use_cache_meta:   使用 Chromium 缓存元数据（URL 命名 + 智能分类）
+        merge_video:      合并视频分片为完整文件
 
     返回:
         各类型计数 dict，如 {"png": 86, "jpeg": 75, ...}
@@ -431,58 +502,113 @@ def extract(
     report_entries: list[dict] = []
     invalid_count = 0
 
+    # 解析缓存元数据（URL → body_file 映射）
+    cache_entries: List[CacheEntry] = []
+    body_file_map: Dict[str, CacheEntry] = {}
+    if use_cache_meta:
+        try:
+            cache_entries = parse_cache(input_dir)
+            for e in cache_entries:
+                if e.body_file:
+                    body_file_map[e.body_file] = e
+        except Exception as exc:
+            print(f"[警告] 解析缓存元数据失败，回退到 magic bytes 模式: {exc}",
+                  file=sys.stderr)
+            cache_entries = []
+            body_file_map = {}
+
+    # 合并视频分片
+    if merge_video and cache_entries:
+        video_results = merge_video_segments(cache_entries, input_dir, output_root, force)
+        for type_name, rel in video_results:
+            counts[type_name] = counts.get(type_name, 0) + 1
+
     for i, src in enumerate(files, 1):
+        # 跳过空文件
+        if src.stat().st_size == 0:
+            if progress:
+                progress(i, total, "empty", src.name)
+            continue
+
+        # 跳过缓存元数据文件和已合并的视频分片
+        if src.name in CACHE_META_NAMES:
+            type_name, rel = "cache_meta", f"cache_meta/{src.name}"
+            dest_dir = output_root / "cache_meta"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / src.name
+            if not (dest.exists() and not force):
+                shutil.copy2(src, dest)
+            counts[type_name] = counts.get(type_name, 0) + 1
+            if progress:
+                progress(i, total, type_name, src.name)
+            continue
+
+        # 视频分片已合并，跳过单独的分片文件
+        if merge_video:
+            entry = body_file_map.get(src.name)
+            if entry and is_video_segment(entry.url):
+                if progress:
+                    progress(i, total, "merged", src.name)
+                continue
+            # 未匹配到 URL 的 1MB 文件也是视频分片
+            if src.stat().st_size == 1048576 and src.name not in body_file_map:
+                if progress:
+                    progress(i, total, "merged", src.name)
+                continue
+
+        # 使用缓存元数据进行分类和命名
+        entry = body_file_map.get(src.name)
+        if entry and use_cache_meta:
+            type_name = classify_by_url(entry.url, entry.content_type, src.stat().st_size)
+            # 类型名 → 子目录映射
+            subdir_map = {
+                "image/png": "images/png",
+                "image/jpeg": "images/jpg",
+                "image/webp": "images/webp",
+                "image/gif": "images/gif",
+                "video": "video",
+                "json": "json",
+            }
+            subdir = subdir_map.get(type_name, "unknown")
+            ext_map = {
+                "image/png": ".png",
+                "image/jpeg": ".jpg",
+                "image/webp": ".webp",
+                "image/gif": ".gif",
+                "video": ".webm",
+                "json": ".json",
+            }
+            ext = ext_map.get(type_name, "")
+
+            dest_dir = output_root / subdir
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            # 使用 URL 派生的文件名
+            base_name = url_to_filename(entry.url)
+            if not base_name:
+                base_name = src.name
+            if ext and not base_name.lower().endswith(ext):
+                base_name += ext
+            dest = dest_dir / base_name
+
+            # 处理重名
+            if dest.exists() and not force:
+                counts[type_name] = counts.get(type_name, 0) + 1
+                if progress:
+                    progress(i, total, type_name, src.name)
+                continue
+
+            shutil.copy2(src, dest)
+            counts[type_name] = counts.get(type_name, 0) + 1
+            if progress:
+                progress(i, total, type_name, src.name)
+            continue
+
+        # 回退：magic bytes 分类
         type_name, rel = classify_and_copy(src, output_root, force=force)
-        dest = output_root / rel
-        entry = {
-            "source": src.name,
-            "type": type_name,
-            "dest": rel,
-            "size": src.stat().st_size,
-            "verify_copy": None,
-            "verify_content": None,
-            "invalid": False,
-            "reason": "",
-        }
-
-        # 复制完整性校验
-        if do_verify:
-            ok, reason = verify_copy(src, dest)
-            entry["verify_copy"] = ok
-            if not ok:
-                entry["invalid"] = True
-                entry["reason"] = f"copy: {reason}"
-                _move_to_invalid(dest, output_root, reason)
-                invalid_count += 1
-
-        # 内容有效性校验
-        if do_verify_content and not entry["invalid"]:
-            ok, reason = verify_content(dest, type_name, file_size=entry["size"])
-            entry["verify_content"] = ok
-            if not ok:
-                entry["invalid"] = True
-                entry["reason"] = f"content: {reason}"
-                _move_to_invalid(dest, output_root, reason)
-                invalid_count += 1
-
         counts[type_name] = counts.get(type_name, 0) + 1
-        report_entries.append(entry)
-
-        if progress is not None:
-            display = type_name if not entry["invalid"] else "invalid"
-            progress(i, total, display, src.name)
-
-    # 生成校验报告
-    if report_path is not None:
-        report = {
-            "total": total,
-            "invalid": invalid_count,
-            "by_type": counts,
-            "files": report_entries,
-        }
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        with report_path.open("w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
+        if progress:
+            progress(i, total, type_name, src.name)
 
     return counts
 
@@ -505,6 +631,10 @@ def main() -> int:
                         help="校验文件内容结构是否符合判定类型。")
     parser.add_argument("--report", nargs="?", const="report.json", default=None,
                         help="生成校验报告（JSON），默认输出到 report.json。")
+    parser.add_argument("--no-cache-meta", action="store_true",
+                        help="不使用缓存元数据（回退到 magic bytes 分类）。")
+    parser.add_argument("--no-merge-video", action="store_true",
+                        help="不合并视频分片。")
     args = parser.parse_args()
 
     input_dir = resolve_input_dir(args.input)
@@ -539,6 +669,8 @@ def main() -> int:
             input_dir, output_dir, force=args.force, progress=_progress,
             do_verify=args.verify, do_verify_content=args.verify_content,
             report_path=report_path,
+            use_cache_meta=not args.no_cache_meta,
+            merge_video=not args.no_merge_video,
         )
         pbar.close()
     else:
@@ -550,6 +682,8 @@ def main() -> int:
             input_dir, output_dir, force=args.force, progress=_progress,
             do_verify=args.verify, do_verify_content=args.verify_content,
             report_path=report_path,
+            use_cache_meta=not args.no_cache_meta,
+            merge_video=not args.no_merge_video,
         )
 
     print("-" * 60)
