@@ -1,29 +1,21 @@
 # mihoyo-cache-data
 
-从米哈游启动器（miHoYo Launcher / HYP）的 Chromium 缓存目录中提取并分类的资源数据集。
+从米哈游启动器（miHoYo Launcher / HYP）的 Chromium 缓存目录中提取并分类资源的工具集。
 
 ## 数据来源
 
 - 原始缓存路径：`%APPDATA%\miHoYo\HYP\1_1\fedata\Cache\Cache_Data`
-- 启动器基于 Chromium Embedded Framework，其 Simple Cache 机制将网络资源以无扩展名文件（`f_xxxxxx`、`data_0`~`data_3`、`index`）形式存储在 `Cache_Data/` 中。
-- 本仓库通过 magic bytes 识别每个缓存文件的真实类型，并复制到 `Cache_Sorted/` 下对应的子目录。
+- 启动器基于 Chromium Embedded Framework，其 Blockfile Disk Cache 机制将网络资源以无扩展名文件（`f_xxxxxx`、`data_0`~`data_3`、`index`）形式存储在 `Cache_Data/` 中。
+- 本项目通过解析 Chromium 缓存元数据（`index` + `data_#` 中的 EntryStore），建立 URL → `f_*` 文件的映射，结合 HTTP 响应头（content-type）和 URL 扩展名进行智能分类，并将视频分片自动合并。
 
-> 原始 `Cache_Data/` 不纳入版本控制（见 `.gitignore`），仓库只保留分类后的结果。
+> 原始 `Cache_Data/` 与提取结果 `Cache_Sorted/` 均不纳入版本控制（见 `.gitignore`），仓库只保留脚本与文档。
 
 ## 目录结构
 
 ```
 mihoyo-cache-data/
-├── Cache_Sorted/              # 分类后的资源
-│   ├── cache_meta/            # Chromium 缓存元数据 (data_0~3, index)
-│   ├── certificate/           # ASN.1 DER 证书
-│   ├── images/
-│   │   ├── jpg/               # JPEG 图片
-│   │   ├── png/               # PNG 图片
-│   │   └── webp/              # WebP 图片
-│   ├── unknown/               # 无法识别的文件
-│   └── video/                 # WebM 视频（含 EBML 头及 1MB 分片）
 ├── scripts/
+│   ├── cache_parser.py        # Chromium 缓存解析模块（index + entry + URL 映射）
 │   ├── extract_cache.py       # 提取与分类脚本（CLI）
 │   └── gui.py                 # 图形界面（PySide6）
 ├── requirements.txt
@@ -32,19 +24,6 @@ mihoyo-cache-data/
 ├── LICENSE
 └── README.md
 ```
-
-## 分类统计
-
-| 类型        | 数量 |
-| ----------- | ---- |
-| PNG         | 86   |
-| JPEG        | 75   |
-| WebP        | 55   |
-| WebM 视频   | 141  |
-| 证书        | 1    |
-| 缓存元数据  | 5    |
-| 未知        | 11   |
-| **合计**    | 374  |
 
 ## 使用方法
 
@@ -79,6 +58,8 @@ python scripts/gui.py
 - 主题切换（Fusion / 系统原生 / 亮色 / 暗色）
 - 多语言（中文 / English）
 - 覆盖已存在文件、静默模式选项
+- 使用缓存元数据（URL 命名 + 智能分类）开关
+- 视频分片自动合并开关
 - 后台线程执行，不阻塞 UI
 
 ### 命令行模式
@@ -102,30 +83,33 @@ python scripts/extract_cache.py
 python scripts/extract_cache.py --input "C:\path\to\Cache_Data" --output "D:\output\Cache_Sorted" --force
 ```
 
-| 参数           | 说明                                   |
-| -------------- | -------------------------------------- |
-| `-i, --input`  | 指定 Cache_Data 目录路径               |
-| `-o, --output` | 指定分类结果输出目录（默认 Cache_Sorted） |
-| `-f, --force`  | 覆盖已存在的目标文件                   |
-| `-q, --quiet`  | 仅打印汇总，不逐文件输出               |
+| 参数               | 说明                                   |
+| ------------------ | -------------------------------------- |
+| `-i, --input`      | 指定 Cache_Data 目录路径               |
+| `-o, --output`     | 指定分类结果输出目录（默认 Cache_Sorted） |
+| `-f, --force`      | 覆盖已存在的目标文件                   |
+| `-q, --quiet`      | 仅打印汇总，不逐文件输出               |
+| `--no-cache-meta`  | 禁用缓存元数据解析，改用 magic bytes 分类 |
+| `--no-merge-video` | 禁用视频分片自动合并                   |
 
 ## 识别规则
 
-脚本通过读取文件头 magic bytes 判定类型：
+脚本通过解析 Chromium 缓存元数据（URL + HTTP content-type）进行分类，magic bytes 作为兜底：
 
 | 类型        | 特征                                   |
 | ----------- | -------------------------------------- |
-| PNG         | `89 50 4E 47 0D 0A 1A 0A`              |
-| JPEG        | `FF D8 FF`                             |
-| WebP        | `RIFF....WEBP`                         |
-| WebM        | EBML 头 `1A 45 DF A3`                  |
-| 证书 (DER)  | ASN.1 SEQUENCE `30 8x`                 |
+| PNG         | URL 扩展名 `.png` 或 content-type `image/png` |
+| JPEG        | URL 扩展名 `.jpg`/`.jpeg` 或 content-type `image/jpeg` |
+| WebP        | URL 扩展名 `.webp` 或 content-type `image/webp` |
+| WebM        | URL 扩展名 `.webm` 或 content-type `video/webm` |
+| 证书 (DER)  | URL 扩展名 `.cer`/`.crt` 或 magic bytes `30 8x` |
 | 缓存元数据  | 文件名 `index` / `data_0`..`data_n`    |
-| JSON        | 可被 `json.loads` 解析的文本           |
-| 视频分片    | 文件大小恰好为 1048576 字节（1MB）     |
+| JSON        | content-type `application/json` 或可被 `json.loads` 解析的文本 |
+| 视频分片    | URL 后缀 `:hash:N`（N 为十六进制序号） |
 
-> 视频文件超过 1MB 时会被 Chromium 切成 1MB 的块，续分片不含 EBML 头，
-> 因此通过文件大小（1048576 字节）识别为视频分片。
+> 启用缓存元数据解析后（默认开启），输出文件名将来自原始 URL 的哈希值而非 `f_xxxxxx`，
+> 分类依据为 URL 扩展名与 HTTP content-type，比单纯 magic bytes 更准确。
+> 视频分片（range request）会按序号自动拼接成完整 WebM 文件。
 
 ## License
 

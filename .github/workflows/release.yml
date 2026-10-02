@@ -15,14 +15,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Package Cache_Sorted
+      - name: Package scripts
         run: |
-          cd Cache_Sorted
-          zip -r ../Cache_Sorted.zip .
+          mkdir -p release-pkg
+          cp -r scripts release-pkg/
+          cp requirements.txt README.md LICENSE release-pkg/
+          cd release-pkg
+          zip -r ../mihoyo-cache-data.zip .
           cd ..
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: Cache_Sorted.zip
+          files: mihoyo-cache-data.zip
           generate_release_notes: true
