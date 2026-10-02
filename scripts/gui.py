@@ -71,6 +71,11 @@ I18N = {
         "stop": "停止",
         "force": "覆盖已存在文件",
         "quiet": "静默模式（不逐条输出）",
+        "verify_copy": "校验复制完整性（SHA256）",
+        "verify_content": "校验内容有效性",
+        "gen_report": "生成校验报告",
+        "invalid": "无效",
+        "report_saved": "校验报告已保存: {path}",
         "progress": "进度",
         "log": "日志",
         "stats": "分类统计",
@@ -102,6 +107,11 @@ I18N = {
         "stop": "Stop",
         "force": "Overwrite existing files",
         "quiet": "Quiet mode (no per-file log)",
+        "verify_copy": "Verify copy integrity (SHA256)",
+        "verify_content": "Verify content validity",
+        "gen_report": "Generate verification report",
+        "invalid": "Invalid",
+        "report_saved": "Report saved: {path}",
         "progress": "Progress",
         "log": "Log",
         "stats": "Statistics",
@@ -169,12 +179,17 @@ class ExtractThread(QThread):
     stopped = Signal(dict)                  # counts
     failed = Signal(str)                    # error message
 
-    def __init__(self, input_dir: Path, output_dir: Path, force: bool, quiet: bool):
+    def __init__(self, input_dir: Path, output_dir: Path, force: bool, quiet: bool,
+                 do_verify: bool = False, do_verify_content: bool = False,
+                 report_path: Path | None = None):
         super().__init__()
         self.input_dir = input_dir
         self.output_dir = output_dir
         self.force = force
         self.quiet = quiet
+        self.do_verify = do_verify
+        self.do_verify_content = do_verify_content
+        self.report_path = report_path
         self._stop = False
 
     def stop(self) -> None:
@@ -187,6 +202,9 @@ class ExtractThread(QThread):
                 self.output_dir,
                 force=self.force,
                 progress=self._on_progress,
+                do_verify=self.do_verify,
+                do_verify_content=self.do_verify_content,
+                report_path=self.report_path,
             )
             if self._stop:
                 self.stopped.emit(counts)
@@ -211,6 +229,7 @@ class MainWindow(QMainWindow):
         self.tr = I18N[self.lang]
         self.worker: ExtractThread | None = None
         self._stats: dict[str, int] = {}
+        self._invalid_count = 0
 
         self._build_ui()
         self._apply_theme("fusion")
@@ -266,8 +285,17 @@ class MainWindow(QMainWindow):
         opt = QHBoxLayout()
         self.force_cb = QCheckBox()
         self.quiet_cb = QCheckBox()
+        self.verify_copy_cb = QCheckBox()
+        self.verify_copy_cb.setChecked(True)
+        self.verify_content_cb = QCheckBox()
+        self.verify_content_cb.setChecked(True)
+        self.gen_report_cb = QCheckBox()
+        self.gen_report_cb.setChecked(True)
         opt.addWidget(self.force_cb)
         opt.addWidget(self.quiet_cb)
+        opt.addWidget(self.verify_copy_cb)
+        opt.addWidget(self.verify_content_cb)
+        opt.addWidget(self.gen_report_cb)
         opt.addStretch(1)
         root.addLayout(opt)
 
@@ -345,6 +373,9 @@ class MainWindow(QMainWindow):
         self.output_browse.setText(tr["browse"])
         self.force_cb.setText(tr["force"])
         self.quiet_cb.setText(tr["quiet"])
+        self.verify_copy_cb.setText(tr["verify_copy"])
+        self.verify_content_cb.setText(tr["verify_content"])
+        self.gen_report_cb.setText(tr["gen_report"])
         self.start_btn.setText(tr["start"])
         self.open_btn.setText(tr["open_output"])
         self.progress_label.setText(tr["ready"])
@@ -435,6 +466,12 @@ class MainWindow(QMainWindow):
             self.stats_table.setItem(row, 0, QTableWidgetItem(name))
             self.stats_table.setItem(row, 1, QTableWidgetItem(str(counts[name])))
             total += counts[name]
+        if self._invalid_count:
+            row = self.stats_table.rowCount()
+            self.stats_table.insertRow(row)
+            item = QTableWidgetItem(self.tr["invalid"])
+            self.stats_table.setItem(row, 0, item)
+            self.stats_table.setItem(row, 1, QTableWidgetItem(str(self._invalid_count)))
         row = self.stats_table.rowCount()
         self.stats_table.insertRow(row)
         self.stats_table.setItem(row, 0, QTableWidgetItem(self.tr["total"]))
@@ -462,16 +499,23 @@ class MainWindow(QMainWindow):
             return
 
         self._stats = {}
+        self._invalid_count = 0
         self._update_stats({})
         self.log_text.clear()
         self.start_btn.setText(tr["stop"])
         self.progress_label.setText(tr["running"])
         self.progress_bar.setValue(0)
 
+        report_path = (Path(output_path) / "report.json").resolve() \
+            if self.gen_report_cb.isChecked() else None
+
         self.worker = ExtractThread(
             Path(input_path), Path(output_path),
             force=self.force_cb.isChecked(),
             quiet=self.quiet_cb.isChecked(),
+            do_verify=self.verify_copy_cb.isChecked(),
+            do_verify_content=self.verify_content_cb.isChecked(),
+            report_path=report_path,
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_ok.connect(self._on_done)
@@ -484,7 +528,10 @@ class MainWindow(QMainWindow):
         pct = int(current / total * 100) if total else 0
         self.progress_bar.setValue(pct)
         self.progress_label.setText(f"{current}/{total}  {type_name}")
-        self._stats[type_name] = self._stats.get(type_name, 0) + 1
+        if type_name == "invalid":
+            self._invalid_count += 1
+        else:
+            self._stats[type_name] = self._stats.get(type_name, 0) + 1
         if not self.quiet_cb.isChecked():
             self._log(f"  {type_name:>12}  {filename}")
         self._update_stats(self._stats)
@@ -493,8 +540,13 @@ class MainWindow(QMainWindow):
         self._update_stats(counts)
         total = sum(counts.values())
         self.progress_bar.setValue(100)
-        self.progress_label.setText(self.tr["done"].format(total=total))
-        self._log(self.tr["done"].format(total=total))
+        msg = self.tr["done"].format(total=total)
+        if self._invalid_count:
+            msg += f"  ({self._invalid_count} {self.tr['invalid']})"
+        self.progress_label.setText(msg)
+        self._log(msg)
+        if self.gen_report_cb.isChecked():
+            self._log(self.tr["report_saved"].format(path=self.worker.report_path))
 
     def _on_stopped(self, counts: dict[str, int]) -> None:
         self._update_stats(counts)
