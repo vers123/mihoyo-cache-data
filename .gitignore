@@ -1,0 +1,23 @@
+# 原始缓存数据（体积大，不入库）
+Cache_Data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 临时文件
+*.tmp
+*.log
