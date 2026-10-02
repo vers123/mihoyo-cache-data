@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from extract_cache import (  # noqa: E402
     extract,
     default_cache_dir,
+    project_root,
     resolve_output_dir,
 )
 
