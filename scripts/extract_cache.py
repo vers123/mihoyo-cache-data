@@ -86,7 +86,8 @@ UNKNOWN_EXT = ".bin"
 # 核心逻辑
 # ---------------------------------------------------------------------------
 
-def detect_type(data: bytes, filename: str, file_size: int = 0) -> Tuple[str, str, str]:
+def detect_type(data: bytes, filename: str, file_size: int = 0,
+                fpath: Optional[Path] = None) -> Tuple[str, str, str]:
     """根据文件头、文件名和文件大小识别类型。
 
     返回: (类型名, 相对子目录, 扩展名)
@@ -118,27 +119,38 @@ def detect_type(data: bytes, filename: str, file_size: int = 0) -> Tuple[str, st
     if file_size == 1048576:
         return "webm", "video", ".webm"
 
-    # 5. 文本文件：不含 null 字节且可打印字符占比高
-    if file_size > 0 and _is_text(data, file_size):
+    # 5. 文本文件：扫描整个文件确认无 null 字节，且头部可打印占比高
+    if file_size > 0 and _is_text(data, file_size, fpath):
         return "text", "text", ".txt"
 
     # 6. 无法识别
     return "unknown", "unknown", UNKNOWN_EXT
 
 
-def _is_text(data: bytes, file_size: int, sample_size: int = 8192) -> bool:
+def _is_text(data: bytes, file_size: int, fpath: Optional[Path] = None,
+             sample_size: int = 8192) -> bool:
     """判断文件是否为文本。
 
     条件：
-        - 采样范围内不含 null 字节 (0x00)
-        - 可打印字符（ASCII 可打印 + 空白 + UTF-8 多字节）占比 > 90%
+        - 整个文件不含 null 字节 (0x00)
+        - 头部采样的可打印字符（ASCII 可打印 + 空白 + UTF-8 多字节）占比 > 90%
     """
     sample = data[:sample_size] if len(data) >= sample_size else data
     if not sample:
         return False
-    # 文本文件通常不含 null 字节
+    # 头部采样不含 null 字节
     if b"\x00" in sample:
         return False
+    # 整个文件不含 null 字节（分块扫描，避免大文件内存占用）
+    if fpath is not None:
+        try:
+            with fpath.open("rb") as f:
+                while chunk := f.read(65536):
+                    if b"\x00" in chunk:
+                        return False
+        except OSError:
+            return False
+    # 可打印字符占比
     printable = 0
     for byte in sample:
         if 0x20 <= byte <= 0x7E or byte in (0x09, 0x0A, 0x0D):
@@ -165,7 +177,8 @@ def classify_and_copy(
     返回: (类型名, 目标相对路径)
     """
     head = read_head(src)
-    type_name, subdir, ext = detect_type(head, src.name, file_size=src.stat().st_size)
+    file_size = src.stat().st_size
+    type_name, subdir, ext = detect_type(head, src.name, file_size=file_size, fpath=src)
 
     dest_dir = output_root / subdir
     dest_dir.mkdir(parents=True, exist_ok=True)
