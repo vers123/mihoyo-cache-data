@@ -309,12 +309,23 @@ class MainWindow(QMainWindow):
         self.resize(780, 620)
         self.setMinimumSize(700, 540)
 
-        # 预填默认输出路径
+        # 预填默认路径（与 CLI 优先级一致：项目根 Cache_Data -> 系统默认缓存路径）
         self.output_edit.setText(str(resolve_output_dir(None)))
-        # 预填默认输入路径提示
-        d = default_cache_dir()
-        if d:
-            self.input_edit.setText(str(d))
+        default_in = self._default_input_dir()
+        if default_in:
+            self.input_edit.setText(str(default_in))
+
+    def _default_input_dir(self) -> Path | None:
+        """按与 CLI 一致的优先级返回默认输入目录。"""
+        # 1. 项目根 Cache_Data
+        local = project_root() / "Cache_Data"
+        if local.is_dir():
+            return local
+        # 2. 系统默认缓存路径
+        sys_default = default_cache_dir()
+        if sys_default:
+            return sys_default
+        return None
 
     def _wrap_group(self, widget: QWidget) -> QGroupBox:
         box = QGroupBox()
@@ -360,7 +371,9 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- handlers
     def _browse(self, kind: str) -> None:
-        d = QFileDialog.getExistingDirectory(self, self.tr["browse"])
+        current = self.input_edit.text() if kind == "input" else self.output_edit.text()
+        start = current if Path(current).is_dir() else str(Path.home())
+        d = QFileDialog.getExistingDirectory(self, self.tr["browse"], start)
         if d:
             if kind == "input":
                 self.input_edit.setText(d)
