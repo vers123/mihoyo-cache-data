@@ -16,7 +16,9 @@
 mihoyo-cache-data/
 ├── scripts/
 │   ├── cache_parser.py        # Chromium 缓存解析模块（index + entry + URL 映射）
-│   ├── extract_cache.py       # 提取与分类脚本（CLI）
+│   ├── extract_cache.py       # 提取与分类主脚本（CLI）
+│   ├── webm_repair.py         # WebM 视频分片合并 + 不完整视频修复
+│   ├── verify.py              # 文件校验（SHA256 完整性 + 内容结构）
 │   └── gui.py                 # 图形界面（PySide6）
 ├── requirements.txt
 ├── .github/workflows/release.yml
@@ -89,8 +91,12 @@ python scripts/extract_cache.py --input "C:\path\to\Cache_Data" --output "D:\out
 | `-o, --output`     | 指定分类结果输出目录（默认 Cache_Sorted） |
 | `-f, --force`      | 覆盖已存在的目标文件                   |
 | `-q, --quiet`      | 仅打印汇总，不逐文件输出               |
+| `--verify`         | 复制后校验完整性（大小 + SHA256 哈希） |
+| `--verify-content` | 校验文件内容结构是否符合判定类型       |
+| `--report`         | 生成校验报告（JSON），默认 report.json |
 | `--no-cache-meta`  | 禁用缓存元数据解析，改用 magic bytes 分类 |
 | `--no-merge-video` | 禁用视频分片自动合并                   |
+| `--repair-video`   | 尝试修复不完整视频（借用完整视频头部，从有效关键帧开始） |
 
 ## 识别规则
 
@@ -110,6 +116,19 @@ python scripts/extract_cache.py --input "C:\path\to\Cache_Data" --output "D:\out
 > 启用缓存元数据解析后（默认开启），输出文件名将来自原始 URL 的哈希值而非 `f_xxxxxx`，
 > 分类依据为 URL 扩展名与 HTTP content-type，比单纯 magic bytes 更准确。
 > 视频分片（range request）会按序号自动拼接成完整 WebM 文件。
+
+### 视频分片与修复
+
+- **完整视频**：分片序号从 0 开始且连续 → 输出到 `video/`
+- **不完整视频**：缺少开头或中间有断档 → 输出到 `video_incomplete/`（`.partial` 后缀）
+- **视频修复**：启用 `--repair-video` 后，从不完整视频中查找第一个有效 VP9 关键帧，
+  借用完整视频的 WebM 头部（Info + Tracks）拼接，修复成功的输出到 `video_repaired/`。
+  修复后的视频会丢失有效关键帧之前的内容，但从该帧起可正常播放。
+
+### 校验
+
+启用 `--verify` 和 `--verify-content` 后，复制完成的文件会经过完整性（SHA256）和内容结构校验，
+校验失败的文件移入 `invalid/` 目录，失败记录写入 `--report` 指定的 JSON 报告。
 
 ## License
 

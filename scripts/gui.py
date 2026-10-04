@@ -76,6 +76,7 @@ I18N = {
         "gen_report": "生成校验报告",
         "use_cache_meta": "使用缓存元数据（URL 命名 + 智能分类）",
         "merge_video": "合并视频分片",
+        "repair_video": "修复不完整视频（借用头部）",
         "invalid": "无效",
         "report_saved": "校验报告已保存: {path}",
         "progress": "进度",
@@ -114,6 +115,7 @@ I18N = {
         "gen_report": "Generate verification report",
         "use_cache_meta": "Use cache metadata (URL naming + smart classify)",
         "merge_video": "Merge video segments",
+        "repair_video": "Repair incomplete videos (borrow header)",
         "invalid": "Invalid",
         "report_saved": "Report saved: {path}",
         "progress": "Progress",
@@ -186,7 +188,8 @@ class ExtractThread(QThread):
     def __init__(self, input_dir: Path, output_dir: Path, force: bool, quiet: bool,
                  do_verify: bool = False, do_verify_content: bool = False,
                  report_path: Path | None = None,
-                 use_cache_meta: bool = True, merge_video: bool = True):
+                 use_cache_meta: bool = True, merge_video: bool = True,
+                 repair_video: bool = False):
         super().__init__()
         self.input_dir = input_dir
         self.output_dir = output_dir
@@ -197,6 +200,7 @@ class ExtractThread(QThread):
         self.report_path = report_path
         self.use_cache_meta = use_cache_meta
         self.merge_video = merge_video
+        self.repair_video = repair_video
         self._stop = False
 
     def stop(self) -> None:
@@ -214,6 +218,7 @@ class ExtractThread(QThread):
                 report_path=self.report_path,
                 use_cache_meta=self.use_cache_meta,
                 merge_video=self.merge_video,
+                repair_video=self.repair_video,
             )
             if self._stop:
                 self.stopped.emit(counts)
@@ -304,6 +309,8 @@ class MainWindow(QMainWindow):
         self.use_cache_meta_cb.setChecked(True)
         self.merge_video_cb = QCheckBox()
         self.merge_video_cb.setChecked(True)
+        self.repair_video_cb = QCheckBox()
+        self.repair_video_cb.setChecked(False)
         opt.addWidget(self.force_cb)
         opt.addWidget(self.quiet_cb)
         opt.addWidget(self.verify_copy_cb)
@@ -311,6 +318,7 @@ class MainWindow(QMainWindow):
         opt.addWidget(self.gen_report_cb)
         opt.addWidget(self.use_cache_meta_cb)
         opt.addWidget(self.merge_video_cb)
+        opt.addWidget(self.repair_video_cb)
         opt.addStretch(1)
         root.addLayout(opt)
 
@@ -393,6 +401,7 @@ class MainWindow(QMainWindow):
         self.gen_report_cb.setText(tr["gen_report"])
         self.use_cache_meta_cb.setText(tr["use_cache_meta"])
         self.merge_video_cb.setText(tr["merge_video"])
+        self.repair_video_cb.setText(tr["repair_video"])
         self.start_btn.setText(tr["start"])
         self.open_btn.setText(tr["open_output"])
         self.progress_label.setText(tr["ready"])
@@ -535,6 +544,7 @@ class MainWindow(QMainWindow):
             report_path=report_path,
             use_cache_meta=self.use_cache_meta_cb.isChecked(),
             merge_video=self.merge_video_cb.isChecked(),
+            repair_video=self.repair_video_cb.isChecked(),
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_ok.connect(self._on_done)
