@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -43,6 +44,7 @@ from cache_parser import (  # noqa: E402
     CacheEntry,
     classify_by_url,
     get_seg_index,
+    get_total_size_from_content_range,
     get_video_base_url,
     is_video_segment,
     parse_cache,
@@ -210,6 +212,37 @@ def classify_and_copy(
 # 视频分片合并
 # ---------------------------------------------------------------------------
 
+def _ffprobe_playable(path: Path) -> bool:
+    """用 ffprobe 检测视频文件是否可播放。ffprobe 不可用时返回 True（跳过校验）。"""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return True
+
+
+def _check_segments_complete(segs: List[CacheEntry]) -> Tuple[bool, str]:
+    """检查视频分片是否完整（包含 index 0 且序号连续）。
+
+    返回: (是否完整, 不完整原因)
+    """
+    indices = sorted(get_seg_index(s.url) for s in segs)
+    if not indices:
+        return False, "no segments"
+    if indices[0] != 0:
+        return False, f"missing first segment (starts at index {indices[0]})"
+    expected = set(range(indices[0], indices[-1] + 1))
+    actual = set(indices)
+    missing = expected - actual
+    if missing:
+        return False, f"missing segments: {sorted(missing)}"
+    return True, ""
+
+
 def merge_video_segments(
     entries: List[CacheEntry],
     input_dir: Path,
@@ -218,11 +251,17 @@ def merge_video_segments(
 ) -> List[Tuple[str, str]]:
     """将视频分片合并为完整视频文件。
 
+    - 分片排序：优先用分片自身的 Content-Range（字节偏移），回退到 URL 中的序号 N
+    - 完整性检测：必须包含 index 0 且序号连续，否则输出到 video_incomplete/ 并加 .partial 后缀
+    - 合并后用 ffprobe 校验可播放性，失败的移入 video_incomplete/
+
     返回: [(type_name, dest_rel_path), ...]
     """
     results = []
     video_dir = output_root / "video"
     video_dir.mkdir(parents=True, exist_ok=True)
+    incomplete_dir = output_root / "video_incomplete"
+    incomplete_dir.mkdir(parents=True, exist_ok=True)
 
     # 按基础 URL 分组
     groups: Dict[str, List[CacheEntry]] = {}
@@ -231,22 +270,38 @@ def merge_video_segments(
             base = get_video_base_url(e.url)
             groups.setdefault(base, []).append(e)
 
+    # 主 entry 的 content-length / content-range（用于校验总大小）
+    base_total_size: Dict[str, int] = {}
+    for e in entries:
+        if not is_video_segment(e.url) and e.headers:
+            ts = get_total_size_from_content_range(e.headers)
+            if ts:
+                base_total_size[e.url] = ts
+
     for base, segs in groups.items():
-        # 按分片序号排序
-        segs.sort(key=lambda x: get_seg_index(x.url))
-        # 只合并有 body_file 的分片
+        # 分片排序：用 URL 中的序号 N。
+        # 注意：分片继承的主 entry content-range 是完整文件大小（bytes 0-XXXX/YYYY），
+        # 不能用于单个分片的排序，因此统一使用 URL 序号。
+        segs.sort(key=lambda s: get_seg_index(s.url))
         segs_with_body = [s for s in segs if s.body_file]
         if not segs_with_body:
             continue
 
-        # 输出文件名
         out_name = url_to_filename(base)
         if not out_name.endswith(".webm"):
             out_name += ".webm"
-        dest = video_dir / out_name
+
+        # 完整性检测
+        complete, reason = _check_segments_complete(segs_with_body)
+
+        if complete:
+            dest = video_dir / out_name
+        else:
+            dest = incomplete_dir / (out_name + ".partial")
 
         if dest.exists() and not force:
-            results.append(("video", str(dest.relative_to(output_root))))
+            results.append(("video_incomplete" if not complete else "video",
+                            str(dest.relative_to(output_root))))
             continue
 
         # 按顺序拼接分片
@@ -257,7 +312,16 @@ def merge_video_segments(
                     with open(src, "rb") as in_f:
                         shutil.copyfileobj(in_f, out_f)
 
-        results.append(("video", str(dest.relative_to(output_root))))
+        # 完整视频：ffprobe 校验，失败则移入 incomplete
+        if complete:
+            if not _ffprobe_playable(dest):
+                partial = incomplete_dir / (out_name + ".partial")
+                dest.rename(partial)
+                dest = partial
+                complete = False
+
+        type_name = "video" if complete else "video_incomplete"
+        results.append((type_name, str(dest.relative_to(output_root))))
 
     return results
 

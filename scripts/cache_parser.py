@@ -196,7 +196,38 @@ def parse_cache(cache_dir: str | Path) -> List[CacheEntry]:
         )
         entries.append(entry)
 
+    # 后处理：视频分片 entry 通常没有 headers，从对应的主 entry（base URL）继承
+    # 主 entry 的 URL 无 :hash:N 后缀，包含 content-type / content-range 等
+    base_headers: Dict[str, Dict[str, str]] = {}
+    for e in entries:
+        if e.headers:
+            base = get_video_base_url(e.url) if is_video_segment(e.url) else e.url
+            base_headers[base] = e.headers
+
+    for e in entries:
+        if not e.headers and is_video_segment(e.url):
+            base = get_video_base_url(e.url)
+            if base in base_headers:
+                e.headers = base_headers[base]
+                e.content_type = e.headers.get("content-type", e.content_type)
+                try:
+                    e.content_length = int(e.headers.get("content-length", "0"))
+                except ValueError:
+                    pass
+
     return entries
+
+
+def get_total_size_from_content_range(headers: Dict[str, str]) -> int:
+    """从 Content-Range 头解析完整文件总大小。
+
+    Content-Range 格式: bytes 0-12345/67890 → 返回 67890
+    """
+    cr = headers.get("content-range", "")
+    m = re.search(r"/(\d+)$", cr)
+    if m:
+        return int(m.group(1))
+    return 0
 
 
 def url_to_filename(url: str) -> str:
