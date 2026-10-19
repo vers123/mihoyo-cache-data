@@ -2,6 +2,8 @@
 
 从米哈游启动器（miHoYo Launcher / HYP）的 Chromium 缓存目录中提取并分类资源的工具集。
 
+> **免责声明**：本项目仅用于学习与技术研究，不包含、不分发任何游戏资源或数据；与米哈游（miHoYo / HoYoverse）及其关联公司无任何关系。
+
 ## 数据来源
 
 - 原始缓存路径：`%APPDATA%\miHoYo\HYP\1_1\fedata\Cache\Cache_Data`
